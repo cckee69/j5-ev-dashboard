@@ -2,7 +2,7 @@
 Serves the mobile PWA in ./web and a JSON API computed from carlinko.db.
 Run: python server.py [port]   (default 8088, binds 0.0.0.0 so Tailscale can reach it)
 """
-import os, sys, json, time, sqlite3, threading, math, urllib.request, urllib.parse
+import os, sys, json, time, sqlite3, threading, math, calendar, urllib.request, urllib.parse
 import hmac, hashlib, base64, secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import known_cars          # per-model constants the telemetry never carries (pack size, tyre scale)
@@ -41,6 +41,15 @@ def _creds():
     except Exception:
         return {}
 
+def _resync_skip():
+    """Late cloud re-sync bursts (the odometer catches up after the car was dark) can't be dated to
+    a day. Default "skip": keep them out of daily totals (accurate per-day numbers). "count" = old
+    behaviour: add them to the day the car reconnected. Toggled from the dashboard Settings tab."""
+    try:
+        return str(json.load(open(os.path.join(_DATA, "creds.json"))).get("resync_km", "skip")).lower() != "count"
+    except Exception:
+        return True
+
 def _ensure_db():
     """Create the telemetry table if missing so summary() never hits a fresh/empty DB."""
     try:
@@ -58,6 +67,27 @@ VEHICLE = {"plate": _V.get("plate") or "—", "model": _V.get("model") or "EV", 
 VEHICLE_IMG = (_V.get("img") or "").strip() or None
 _CAR_PHOTO = os.path.join(_DATA, "car-photo.img")
 TPMS_POS = ["FL", "FR", "RL", "RR"]
+
+def _vehicle_img():
+    """The car's own CarLinko render URL, read fresh so a web login or photo refresh takes
+    effect without a restart."""
+    return ((_creds().get("vehicle") or {}).get("img") or "").strip() or None
+
+def _car_image():
+    """Hero image for /api/summary: the owner's override wins, then the server-cached proxy of
+    CarLinko's own render, else None (client falls back to the bundled J5 render / silhouette)."""
+    c = _creds()
+    override = (c.get("car_image") or "").strip()
+    return override or ("/car-photo" if (c.get("vehicle") or {}).get("img") else None)
+
+def _vehicle_img_url(v):
+    """CarLinko hosts a render of the exact car (model + colour): the /user/vehicle object
+    carries vehicleImgConfig {Front, Side, Top, ...}. Prefer the front view."""
+    try:
+        img = json.loads(v.get("vehicleImgConfig") or "{}")
+        return img.get("Front") or img.get("Side") or img.get("Top")
+    except Exception:
+        return None
 
 def is_configured():
     """True once an account is set up — used to decide whether to show the login page."""
@@ -86,6 +116,11 @@ def web_login(email, password, region="sea", gmaps_key=None, dashboard_password=
         c["vehicle_id"] = str(v["vehicleId"]); c["device_sn"] = str(v.get("deviceId") or "")
         c["vehicle"] = {"plate": v.get("licenseNumber") or "—", "model": v.get("model") or "EV",
                         "vin": v.get("vin") or "—"}
+        img = _vehicle_img_url(v)
+        if img and img != _vehicle_img():
+            c["vehicle"]["img"] = img                     # web login now captures the render too
+            try: os.remove(_CAR_PHOTO)                    # (previously only CLI setup.py did)
+            except Exception: pass                        # bust the old car's cached photo
         json.dump(c, open(cpath, "w"), indent=2)
         try: os.chmod(cpath, 0o600)
         except Exception: pass
@@ -264,7 +299,10 @@ def decode(hexstr):
         d["range_km"] = int.from_bytes(b[29:31], "big")    # validated =248
         d["odometer"] = int.from_bytes(b[18:21], "big")    # validated =882 (0x0372)
         d["volt12"]   = round(int.from_bytes(b[12:14], "big") * 0.01, 2)  # 12V aux ~13.84 (validate on drive)
-        d["ignition"] = b[3]                               # 0=off/parked, !=0=on (flipped 00->01 at start)
+        d["unlocked"] = b[3] != 0                          # 0=locked, !=0=unlocked. VERIFIED: live lock/unlock
+        # test on the Omoda E5 (#5) + J5 data (217 park 0->1 flips; b3=1 lingers a median 105 s
+        # after driving stops -- the walk-away-and-lock delay). NOT ignition, despite the old name;
+        # it doubles as a "car is in use / awake" hint, which is all the logger needs it for.
         d["speed"] = round(int.from_bytes(b[14:16], "big") / 16.0, 1)  # km/h: bytes14-15 BE /16 (calibrated live: raw 320 = 20 km/h)
     if len(b) > 55:
         d["consumption"] = round(b[55] * 0.1, 1)           # car's own avg kWh/100km (byte55 x0.1; matches dash 12.2)
@@ -273,6 +311,41 @@ def decode(hexstr):
         # Kept raw here; summary() decides whether this car has a fuel tank at all.
         d["fuel_pct"]   = b[21]                            # fuel tank %
         d["fuel_l_100"] = round(b[53] * 0.1, 1)            # fuel consumption L/100km
+        # Charging block, decoded from issue #5 (Omoda E5, Uruguay) and verified against 72,507
+        # logged J5 frames + Tiggo 8 / Tiggo 7 PHEV frames from #2/#3 -- see docs/api-map.md.
+        d["charge_mode"] = b[56]                           # connector: 0=none, 1=AC, 16=DC fast
+        d["charge_state"] = b[57]                          # 0=idle 1=charging 2=complete 3=canceled 4=hot 5=stop
+        d["charge_remain"] = int.from_bytes(b[58:60], "big")  # minutes to done; CarLinko sentinels >= 0x3FE = invalid
+        if d["charge_remain"] >= 0x3FE: d["charge_remain"] = None
+        d["charge_power"] = round(int.from_bytes(b[62:64], "big") * 0.1, 1)  # instant power (x0.1 kW; 0 when idle)
+        # NOTE: b62-63 is bidirectional -- the same pair carries regen power while braking
+        # (issue #5, E5 owner). summary() only surfaces it as charge power when b57 == 1.
+        # AC flag: 0 = off, !=0 = on. Live-verified by the E5 owner (#5): a manual A/C toggle moved
+        # exactly this byte and nothing else (fan/temp/seat/defrost changes left it alone).
+        d["ac_on"] = b[23] != 0
+        # Body-state bytes decoded by the Omoda E5 owner in #5 (live-verified on his car; not yet
+        # cross-checked on the J5, so they are surfaced raw and labelled as such where shown).
+        d["doors"] = b[2]                                   # door bitmask (E5, #5): 1=driver,
+                                                            # 2=passenger, 4=rear-driver, 8=rear-passenger
+        d["trunk_open"] = bool(b[4])                        # 0 = closed
+        d["windows"] = b[8]                                 # 2 bits per window: closed/open bits,
+                                                            # both clear = partial (E5, #5)
+        d["sunroof_open"] = bool(b[9])                      # 0 = fully closed (E5, #5)
+        d["ac_temp_c"] = b[24] if b[24] else None           # A/C target temp, raw degC (E5, #5);
+                                                            # the J5 reads 159-169 here -> model-specific
+        d["seat_heat"] = [b[32], b[33]]                     # L, R (0 = off)
+        d["seat_vent"] = [b[37], b[38]]                     # L, R (0 = off)
+        d["defrost_front"] = bool(b[42])
+        # Rated (WLTC) range, NOT a mirror of EV range (b29-30). On the J5 they differ in 72,482 of
+        # 72,507 frames (334 vs 302 at 66% -- 302/0.66 = 457.6, the car's 461 km NEDC rating).
+        # The Omoda E5 owner in #5 cross-checked it live against the app: 304 vs 329, digit-for-digit.
+        # On the Tiggo 8 PHEV they happen to coincide (its EV range IS the rated estimate).
+        d["wltc_range_km"] = int.from_bytes(b[68:70], "big")
+        # HV/motor state per #5 (>=2 = on). The E5 owner's live data: 0=off while parked, 2=ready
+        # in 100% of driving samples, 1 as a 15-90s transition at power on/off -- i.e.
+        # 0=off, 1=low-voltage active, 2=high-voltage/ready. On the J5 the byte also takes 0-3
+        # without tracking ignition (2 dominates even parked), so it stays raw + model-specific.
+        d["hv_state"] = b[5]
     if len(b) > 71:
         # The car's own headline range: EV range on a BEV, *fuel* range on a PHEV. Proven on the
         # Tiggo 8 PHEV over three frames (#2): it held 652 while EV range fell 90 -> 81 (so it is
@@ -332,6 +405,15 @@ MODEL_SPECS = {
         "notes": ["gross_vs_usable", "nedc_optimistic"],
     },
 }
+_TIGGO7 = {
+    "label": "Chery Tiggo 7 PHEV", "source": "owner-reported, issue #3",
+    "performance": [["Power", 279, "PS"], ["Torque", 365, "Nm"], ["Battery", 18.3, "kWh"]],
+    "dimensions": [["Length", 4553, "mm"]],
+    "notes": ["owner_reported"],
+}
+# Malaysia badges the same car "TIGGO 7 CSH", so both keys share the entry.
+MODEL_SPECS["tiggo 7 phev"] = _TIGGO7
+MODEL_SPECS["tiggo 7 csh"] = _TIGGO7
 
 def model_specs(model=None):
     """Specs for this car, or None. creds.json `specs` wins, so an owner can fill in a model we
@@ -366,6 +448,13 @@ MAX_PAIR_GAP = 1800     # >30 min between two logged frames = a hole in the log 
                         # offline, TBox asleep). The odo/SoC delta across a hole covers driving we
                         # never saw, so it can't be attributed to a day/week/trip -- skip the pair.
                         # Slow poll is 300 s, so this only ever trips on a genuine outage.
+ODO_MAX_KMH = 160       # top speed a Jaecoo J5 can plausibly do (~150 km/h); anything faster is batching
+ODO_RESYNC_KM = 12      # a frame pair advancing more than this is a late cloud re-sync, not live
+                        # driving: the car went dark (basement, no signal) and the odometer syncs all
+                        # the accumulated km in one burst when it reconnects. Those km were driven at
+                        # some unknown earlier time, so they can't be dated to a day/trip -- skip the
+                        # pair (the lifetime odo span still includes them). Real driving is ticked in
+                        # ~1 km steps, so the largest genuine batch seen is ~11 km.
 PETROL_KM_L = float(_CC.get("petrol_kml") or 12.0)        # comparable ICE fuel economy (km per litre)
 PETROL_RP_L = float(_CC.get("petrol_price") or 16250)     # petrol price /litre in CUR_CODE
                                                           # (IDR default: Pertamax, Jawa/Bali, 1 Jul 2026)
@@ -374,9 +463,11 @@ def _m(x):
     # round money: whole units at IDR scale (>=100), keep 2 dp for sub-unit currencies (e.g. ZAR /km)
     return round(x) if abs(x) >= 100 else round(x, 2)
 
-def build_trips(data):
+def build_trips(data, resync_skip=True):
     """A trip = a run of moving frames (odometer rising). Bridges brief stops; ends
-    after TRIP_GAP parked. Returns newest-first with km / time / speed / kWh / efficiency."""
+    after TRIP_GAP parked. Returns newest-first with km / time / speed / kWh / efficiency.
+    resync_skip=True skips implausible odo bursts as late cloud re-syncs (see ODO_RESYNC_KM);
+    resync_skip=False counts them (old behaviour)."""
     fr = [(ts, d.get("battery"), d.get("odometer")) for ts, dt, d in data
           if d.get("battery") is not None and d.get("odometer") is not None]
     trips, cur, last_move = [], None, 0
@@ -386,7 +477,16 @@ def build_trips(data):
             if cur:                                    # days of unseen driving, not one long trip
                 trips.append(cur); cur = None
             continue
+        if o1 < o0:                                    # odometer went backwards = byte glitch ->
+            if cur:                                    # trust break, close the trip
+                trips.append(cur); cur = None
+            continue
         if o1 > o0:                                    # moving (odometer rising = reliable)
+            if resync_skip and (o1 - o0) > max(ODO_RESYNC_KM,  # a delta no real drive can cover
+                    (ts1 - ts0) / 3600.0 * ODO_MAX_KMH):   # between two frames is a cloud catch-up
+                if cur:                                # burst (car was dark; km belong to an earlier
+                    trips.append(cur); cur = None      # unknown day) -> skip unless counting
+                continue
             if cur is None:
                 cur = {"start": ts0, "odo0": o0, "soc0": b0}
             cur.update(end=ts1, odo1=o1, soc1=b1); last_move = ts1
@@ -401,12 +501,39 @@ def build_trips(data):
         avg = round(dist / (dur_min / 60.0)) if dur_min else None   # odo/time, reliable
         kwh = max(0.0, (t["soc0"] - t["soc1"]) / 100.0 * CAP_KWH)
         eff = round(kwh / dist * 100, 1) if kwh and dist >= 1 else None
-        if eff is not None and not (5 <= eff <= 40):    # implausible (sparse-data merge) -> hide energy
-            eff = kwh = None
-        out.append({"start_dt": time.strftime("%a %H:%M", time.localtime(t["start"])),
+        if eff is not None and not (5 <= eff <= 40):    # implausible (sparse-data merge, or a SoC drop
+            eff = kwh = None                            # that resyncs with the odo) -> hide energy
+        out.append({"start_ts": t["start"], "end_ts": t["end"],
+                    "start_dt": time.strftime("%a %H:%M", time.localtime(t["start"])),
                     "km": dist, "min": round(dur_min), "avg_kmh": avg,
                     "kwh": round(kwh, 1) if kwh else None, "kwh100": eff})
     return out[::-1]                                    # newest first
+
+def day_energy(data, resync_skip):
+    """kWh used per day from EVERY SoC drop observed between consecutive frames, not just drops
+    inside trips -- a drop often lands while parked (e.g. the BMS settles a minute after you
+    arrive, like 43%->42% right after parking at the destination), and summing trip energy alone
+    loses it. A drop counts when the car was moving on the pair or stopped within 15 min; drops
+    that sync with a late re-sync burst, sit across a log hole, or happen long after the car last
+    moved (parked drain) are excluded -- that energy isn't attributable to driving on that day.
+    Returns {YYYY-MM-DD: kwh}."""
+    frS = [(ts, d2.get("battery"), d2.get("odometer")) for ts, dt2, d2 in data
+           if d2.get("battery") is not None]
+    out = {}
+    last_move = 0
+    for i in range(1, len(frS)):
+        t0, b0, o0 = frS[i-1]; t1, b1, o1 = frS[i]
+        if t1 - t0 > MAX_PAIR_GAP:                     # hole in the log: what happened inside it
+            last_move = 0                              # is unknown -> don't bridge drops across it
+            continue
+        if o0 is not None and o1 is not None and o1 > o0:
+            if resync_skip and (o1 - o0) > max(ODO_RESYNC_KM, (t1 - t0) / 3600.0 * ODO_MAX_KMH):
+                continue                               # re-sync burst: the SoC drop that synced with
+            last_move = t1                             # it is earlier driving, not this day's
+        if b0 is not None and b1 is not None and b0 > b1 and last_move and t1 - last_move <= 900:
+            k = time.strftime("%Y-%m-%d", time.localtime(t1))
+            out[k] = out.get(k, 0.0) + (b0 - b1) / 100.0 * CAP_KWH
+    return out
 
 def build_sessions(fr, now):
     """fr = [(ts, soc, odo)] sorted asc. A charge session = parked (odo flat) frames
@@ -487,8 +614,12 @@ def session_detail(s):
             "kwh_billed": round(s["kwh"] / chg_eff(s["soc1"]), 1),  # metered (what you pay for)
             "cost": round(s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR), "series": series}
 
-def analyze(data):
-    """Energy/efficiency from SoC%+odometer; charging sessions from parked SoC-rise."""
+def analyze(data, trips, kwh_day):
+    """Energy/efficiency from SoC%+odometer; charging sessions from parked SoC-rise.
+    Today/this-week km come from build_trips(), each trip bucketed by the day it STARTED -- a
+    drive that crosses midnight stays one trip on the day it began. Energy comes from
+    day_energy() (every observed SoC drop, parked drops included), so "used today" matches the
+    battery you actually consumed rather than only the drops that landed inside trip frames."""
     out = {
         "battery_kwh": CAP_KWH, "top_speed_today": 0,
         "energy": {"today_kwh": 0.0, "consumption": None, "rating": None, "week_consumption": None},
@@ -498,21 +629,15 @@ def analyze(data):
     today = time.strftime("%Y-%m-%d"); week = time.strftime("%Y-W%W"); month = time.strftime("%Y-%m")
     fr = [(ts, d.get("battery"), d.get("odometer")) for ts, dt, d in data
           if d.get("battery") is not None and d.get("odometer") is not None]
-    used_today = km_today = used_week = km_week = 0.0
-    for i in range(1, len(fr)):
-        ts0, b0, o0 = fr[i-1]; ts1, b1, o1 = fr[i]
-        if ts1 - ts0 > MAX_PAIR_GAP: continue          # hole in the log -> delta spans unlogged
-                                                       # driving; bucketing it by ts1 would dump the
-                                                       # whole outage into today/this week
-        d_today = time.strftime("%Y-%m-%d", time.localtime(ts1)) == today
-        d_week = time.strftime("%Y-W%W", time.localtime(ts1)) == week
-        if b1 < b0:                                    # SoC fell = energy used (count ALL drops, not just
-            e = (b0 - b1) / 100.0 * CAP_KWH            # those that coincide with a 1km odo tick -> no undercount)
-            if d_today: used_today += e
-            if d_week:  used_week += e
-        if o1 > o0:                                    # odo advanced = distance driven
-            if d_today: km_today += (o1 - o0)
-            if d_week:  km_week += (o1 - o0)
+    km_today = km_week = 0.0
+    for t in trips:                                    # trip-start bucketing (see build_trips)
+        if time.strftime("%Y-%m-%d", time.localtime(t["start_ts"])) == today:
+            km_today += t["km"]
+        if time.strftime("%Y-W%W", time.localtime(t["start_ts"])) == week:
+            km_week += t["km"]
+    used_today = kwh_day.get(today, 0.0)
+    used_week = sum(v for k, v in kwh_day.items()
+                    if time.strftime("%Y-W%W", time.strptime(k, "%Y-%m-%d")) == week)
     now = time.time()
     sess = build_sessions(fr, now)
     for s in sess:
@@ -571,10 +696,16 @@ def analyze(data):
     detail = ongoing[-1] if ongoing else (sess[-1] if sess else None)
     if detail:
         out["charging"]["session"] = session_detail(detail)
-    trips_all = build_trips(data)
+    trips_all = trips
     out["trips"] = trips_all[:8]
-    avgs = [t["avg_kmh"] for t in trips_all if t.get("avg_kmh")]
-    out["avg_speed"] = round(sum(avgs) / len(avgs)) if avgs else None   # odo-based, reliable
+    # Overall average speed = total distance / total time, not the mean of per-trip averages
+    # (one short burst trip would dominate -- a cloud catch-up of a few km in ~10 s reads as
+    # 700+ km/h). Only trips that actually lasted a minute count; sub-minute "trips" are
+    # batch catch-ups, not drives.
+    long = [(t["km"], t["end_ts"] - t["start_ts"]) for t in trips_all
+            if t["end_ts"] - t["start_ts"] >= 60]
+    tot_km = sum(x[0] for x in long); tot_s = sum(x[1] for x in long)
+    out["avg_speed"] = round(tot_km / (tot_s / 3600.0)) if (long and tot_s > 0) else None
     out["energy"]["today_kwh"] = round(used_today, 2)
     def rate(cons):
         if cons is None: return None
@@ -664,12 +795,12 @@ def demo_summary():
         "demo": True,
         "vehicle": {"plate": "B 1234 DEMO", "model": "Jaecoo J5 EV", "vin": "DEMOVIN00000J5EV"},
         "online": True, "battery": 72, "range_km": 318, "odometer": 8421, "volt12": 13.6,
-        "ignition": 0, "speed": None, "moving": False, "avg_speed": 41,
+        "unlocked": False, "speed": None, "moving": False, "avg_speed": 41,
         "updated": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 180)), "age_min": 3.0,
         "battery_kwh": cap, "battery_kwh_source": "known", "wltp_kwh_100": 14.8,
         "chemistry_known": True, "powertrain": "bev", "fuel": None,
-        "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
-        "tyre_unit": TYRE_UNIT, "tariff": TARIFF_IDR, "car_image": CAR_IMAGE,
+            "currency": {"symbol": CUR_SYMBOL, "locale": CUR_LOCALE, "code": CUR_CODE},
+            "tyre_unit": TYRE_UNIT, "tariff": TARIFF_IDR, "car_image": _car_image(),
         "specs": model_specs("Jaecoo J5 EV"),   # demo car, not whatever creds.json says
         "energy": {"today_kwh": 6.7, "consumption": 12.9, "rating": "normal",
                    "week_consumption": 13.0, "source": "car"},
@@ -685,7 +816,7 @@ def demo_summary():
         "tyre_status": "Normal", "tyre_indirect": True,
         "km": {"today": 52, "week": 201, "month": 1043},
         "charges": {"week": 2, "month": 9},
-        "history": history,
+        "history": history, "resync_km": "skip",
         "health": {"usable_kwh": cap, "cycles": 31.4, "charged_kwh": 1612.0, "avg_eff": 89, "sessions": 38},
         "lifetime": {"kwh_in": 1448.0, "kwh_billed": 1612.0, "cost": 4090000, "km": 8127,
                      "since": time.strftime("%d %b", time.localtime(now - 96 * 86400)),
@@ -707,7 +838,7 @@ def summary():
     if DEMO:
         return demo_summary()
     out = {"vehicle": VEHICLE, "online": False, "battery": None, "range_km": None,
-           "odometer": None, "volt12": None, "ignition": None, "speed": None,
+           "odometer": None, "volt12": None, "unlocked": None, "speed": None,
            "moving": False, "avg_speed": None, "insights": {}, "health": {}, "drain": None,
            "volt12_min7d": None, "volt12_status": None,
            "updated": None, "age_min": None,
@@ -726,9 +857,9 @@ def summary():
            "tpms": [{"pos": p, "psi": None, "temp": None, "valid": False} for p in TPMS_POS],
            "tpms_updated": None, "tpms_age_min": None, "tpms_live": False, "tpms_raw": None,
            "tyre_status": "Normal", "tyre_indirect": True,
-           "km": {"today": None, "week": None, "month": None},
-           "charges": {"week": None, "month": None},
-           "history": []}
+            "km": {"today": None, "week": None, "month": None},
+            "charges": {"week": None, "month": None},
+            "history": [], "resync_km": "skip"}
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
@@ -745,7 +876,7 @@ def summary():
     ts, dt, dec = data[-1]
     out.update(battery=dec.get("battery"), range_km=dec.get("range_km"),
                odometer=dec.get("odometer"), volt12=dec.get("volt12"),
-               ignition=dec.get("ignition"), speed=None, updated=dt)
+               unlocked=dec.get("unlocked"), speed=None, updated=dt)
     out["age_min"] = round((time.time() - ts) / 60, 1)
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
@@ -787,47 +918,38 @@ def summary():
                 out["tyre_status"] = "Check tyres" if any(p < 28 or p > 40 for p in raw_psi) else "Normal"
             break
 
-    def km_between(fmt):
-        agg = {}
-        for ts, dt, dec in data:
-            odo = dec.get("odometer")
-            if odo is None:
-                continue
-            k = time.strftime(fmt, time.localtime(ts))
-            lo, hi = agg.get(k, (odo, odo))
-            agg[k] = (min(lo, odo), max(hi, odo))
-        return agg
+    # Daily distance comes from trips, each bucketed by the day it STARTED: a drive that crosses
+    # midnight (23:45 -> 00:30) stays one trip on the day it began, so "today" only ever shows
+    # trips that began today -- last night's drive reads under yesterday, not split across two.
+    # Daily energy comes from day_energy(): every observed SoC drop, not just in-trip drops.
+    resync_skip = _resync_skip()
+    out["resync_km"] = "skip" if resync_skip else "count"
+    trips_all = build_trips(data, resync_skip)
+    kwh_day = day_energy(data, resync_skip)
+    km_day = {}
+    for t in trips_all:
+        k = time.strftime("%Y-%m-%d", time.localtime(t["start_ts"]))
+        km_day[k] = km_day.get(k, 0) + t["km"]
     today = time.strftime("%Y-%m-%d")
     week  = time.strftime("%Y-W%W")
     month = time.strftime("%Y-%m")
-    d = km_between("%Y-%m-%d")
-    w = km_between("%Y-W%W")
-    m = km_between("%Y-%m")
-    out["km"]["today"] = (d[today][1] - d[today][0]) if today in d else 0
-    out["km"]["week"]  = (w[week][1] - w[week][0]) if week in w else 0
-    out["km"]["month"] = (m[month][1] - m[month][0]) if month in m else 0
-    # per-day energy used (SoC drop while moving) -> daily efficiency for the trend
-    frS = [(ts, dec2.get("battery"), dec2.get("odometer")) for ts, dt2, dec2 in data
-           if dec2.get("battery") is not None and dec2.get("odometer") is not None]
-    day_used = {}
-    for i in range(1, len(frS)):
-        t0, b0, o0 = frS[i-1]; t1, b1, o1 = frS[i]
-        if t1 - t0 > MAX_PAIR_GAP: continue            # hole in the log -> a whole outage's SoC drop
-        if b0 > b1:                                    # SoC fell = energy spent (every drop, not only the
-            k = time.strftime("%Y-%m-%d", time.localtime(t1))   # ones aligned to a 1km odo tick)
-            day_used[k] = day_used.get(k, 0.0) + (b0 - b1) / 100.0 * CAP_KWH
-    # last 7 days km + efficiency series
+    out["km"]["today"] = km_day.get(today, 0)
+    out["km"]["week"]  = sum(t["km"] for t in trips_all
+                             if time.strftime("%Y-W%W", time.localtime(t["start_ts"])) == week)
+    out["km"]["month"] = sum(t["km"] for t in trips_all
+                             if time.strftime("%Y-%m", time.localtime(t["start_ts"])) == month)
+    # last 7 days km + efficiency series (same trip-start buckets as km.today)
     series = []
     for i in range(6, -1, -1):
         day = time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
-        km = (d[day][1] - d[day][0]) if day in d else 0
-        u = day_used.get(day, 0.0)
+        km = km_day.get(day, 0)
+        u = kwh_day.get(day, 0.0)
         eff = round(u / km * 100, 1) if (km >= 1 and u > 0) else None
         if eff is not None and not (9 <= eff <= 30):   # 1%-coarse SoC over short trips lies; hide it
             eff = None
         series.append({"day": day[5:], "km": km, "kwh": round(u, 1), "eff": eff})
     out["history"] = series
-    res = analyze(data)
+    res = analyze(data, trips_all, kwh_day)
     out["battery_kwh"] = res["battery_kwh"]
     out["energy"] = res["energy"]
     # prefer the car's own BMS consumption (byte55) over the coarse SoC-derived estimate.
@@ -843,6 +965,20 @@ def summary():
         out["energy"]["rating"] = ("optimal" if rc < WLTP_KWH_100 else "normal" if rc < 18 else "boros")
         out["energy"]["source"] = "car"
     out["charging"] = res["charging"]
+    # Prefer the car's own charging flags over the SoC-derived session detector: b56/b57/b62-63
+    # report connector, state and instant power directly (verified on J5 DC + Tiggo 8 AC frames,
+    # issue #5). The car flips to "active" the moment the charger starts, before any SoC tick.
+    cmode = dec.get("charge_mode"); cstate = dec.get("charge_state")
+    out["charging"]["mode"] = {16: "dc", 1: "ac"}.get(cmode)
+    out["charging"]["state"] = cstate
+    out["charging"]["remaining_min"] = dec.get("charge_remain")
+    if cstate == 1 and dec.get("charge_power") is not None:
+        out["charging"]["active"] = True
+        out["charging"]["rate_kw"] = dec["charge_power"]
+        out["charging"]["rate_source"] = "car"
+    elif out["charging"]["active"]:
+        out["charging"]["rate_source"] = "soc-estimate"
+    out["wltc_range_km"] = dec.get("wltc_range_km")
     out["trips"] = res.get("trips", [])
     out["avg_speed"] = res.get("avg_speed")
     out["health"] = res.get("health", {})
@@ -864,10 +1000,72 @@ def summary():
         lf["liters_saved"] = round(lf["km"] / PETROL_KM_L, 1)        # petrol you didn't burn
         lf["co2_saved"] = round(lf["km"] / PETROL_KM_L * 2.31)       # ~2.31 kg CO2 per litre petrol
     out["charges"] = {"week": res["charging"]["week"], "month": res["charging"]["month"]}
-    # if actively charging, reflect it in the headline state
-    if res["charging"]["active"]:
-        out["ignition"] = out.get("ignition")
     return out
+
+def month_history(month):
+    """Per-day km / kWh / charging for one calendar month -- the dashboard's calendar view.
+    month = 'YYYY-MM' (defaults to the current month). Same buckets as summary(): km by trip
+    start, energy from day_energy(), charging from build_sessions()."""
+    try:
+        y, m = (int(x) for x in (month or "").split("-")[:2])
+        if not (1 <= m <= 12):
+            raise ValueError
+    except Exception:
+        now = time.localtime(); y, m = now.tm_year, now.tm_mon
+    t0 = int(time.mktime(time.struct_time((y, m, 1, 0, 0, 0, 0, 0, -1))))
+    ny, nm = (y, m + 1) if m < 12 else (y + 1, 1)
+    t1 = int(time.mktime(time.struct_time((ny, nm, 1, 0, 0, 0, 0, 0, -1))))
+    ndays = calendar.monthrange(y, m)[1]
+    empty = {"month": f"{y:04d}-{m:02d}", "days": [],
+             "totals": {"km": 0, "kwh": 0.0, "chg_kwh": 0.0, "chg_cost": 0},
+             "resync_km": "skip"}
+    if not os.path.exists(DB):
+        return empty
+    conn = sqlite3.connect(DB)
+    rows = conn.execute(
+        "SELECT ts,dt,online,raw FROM telemetry WHERE ts >= ? AND ts < ? ORDER BY ts",
+        (t0, t1)).fetchall()
+    data = []
+    for ts, dt, online, raw in rows:
+        if online != 1 or not raw:
+            continue
+        data.append((ts, dt, decode(raw)))
+    if not data:
+        return empty
+    resync_skip = _resync_skip()
+    trips = build_trips(data, resync_skip)
+    kwh_day = day_energy(data, resync_skip)
+    km_day = {}
+    for t in trips:
+        k = time.strftime("%Y-%m-%d", time.localtime(t["start_ts"]))
+        km_day[k] = km_day.get(k, 0) + t["km"]
+    fr = [(ts, d2.get("battery"), d2.get("odometer")) for ts, dt2, d2 in data
+          if d2.get("battery") is not None and d2.get("odometer") is not None]
+    sess = build_sessions(fr, t1)
+    chg = {}                                            # day -> aggregated charging (in + metered cost)
+    for s in sess:
+        k = time.strftime("%Y-%m-%d", time.localtime(s["start"]))
+        d = chg.setdefault(k, {"kwh": 0.0, "cost": 0, "n": 0})
+        d["kwh"] += s["kwh"]
+        d["cost"] += s["kwh"] / chg_eff(s["soc1"]) * TARIFF_IDR
+        d["n"] += 1
+    days = []
+    for day in range(1, ndays + 1):
+        k = f"{y:04d}-{m:02d}-{day:02d}"
+        km = km_day.get(k, 0); u = kwh_day.get(k, 0.0)
+        eff = round(u / km * 100, 1) if (km >= 1 and u > 0) else None
+        if eff is not None and not (9 <= eff <= 30):    # same gate as the 7-day history
+            eff = None
+        c = chg.get(k)
+        days.append({"d": day, "km": km, "kwh": round(u, 1), "eff": eff,
+                     "chg_kwh": round(c["kwh"], 1) if c else 0,
+                     "chg_cost": round(c["cost"]) if c else 0})
+    return {"month": f"{y:04d}-{m:02d}", "days": days,
+            "totals": {"km": sum(x["km"] for x in days),
+                       "kwh": round(sum(x["kwh"] for x in days), 1),
+                       "chg_kwh": round(sum(x["chg_kwh"] for x in days), 1),
+                       "chg_cost": round(sum(x["chg_cost"] for x in days))},
+            "resync_km": "skip" if resync_skip else "count"}
 
 # ---- long-trip planner: geocode (Nominatim) + route (OSRM) + SPKLU (Overpass/OSM), all keyless ----
 _UA_TRIP = "carlinko-trip/1.0 (personal EV dashboard)"
@@ -1232,10 +1430,11 @@ class H(BaseHTTPRequestHandler):
             return
         if path == "/car-photo":     # cached proxy for CarLinko's own render of this exact car.
             try:                     # Behind the gate: the render gives away model + colour.
+                img = _vehicle_img()
                 if not os.path.exists(_CAR_PHOTO):
-                    if not VEHICLE_IMG:
+                    if not img:
                         self._send(404, b"no vehicle image", "text/plain"); return
-                    req = urllib.request.Request(VEHICLE_IMG, headers={"User-Agent": "carlinko-dash"})
+                    req = urllib.request.Request(img, headers={"User-Agent": "carlinko-dash"})
                     with urllib.request.urlopen(req, timeout=20) as r:
                         blob = r.read(8 * 1024 * 1024)    # cap: it's a car render, not a payload
                     tmp = _CAR_PHOTO + ".part"            # write-then-rename, so an interrupted
@@ -1305,6 +1504,16 @@ class H(BaseHTTPRequestHandler):
             if "error" not in plan:
                 _trip_cache["trip:" + qs] = (time.time(), plan)
             self._send(200, json.dumps(plan).encode(), "application/json")
+            return
+        if path == "/api/history":                     # monthly calendar view: per-day km/kWh/charging
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            q = urllib.parse.parse_qs(qs)
+            try:
+                self._send(200, json.dumps(month_history((q.get("month") or [""])[0])).encode(),
+                           "application/json")
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(),
+                           "application/json")
             return
         if path == "/":
             path = "/index.html" if is_configured() else "/login.html"   # first run -> login page
@@ -1378,6 +1587,57 @@ class H(BaseHTTPRequestHandler):
                            "application/json")
             except Exception as e:
                 self._send(200, json.dumps({"ok": False, "error": str(e)[:180]}).encode(), "application/json")
+            return
+        if path == "/api/photorefresh":                # re-grab this car's render from CarLinko
+            if not self._authed():
+                self._send(401, b'{"ok":false,"error":"auth"}', "application/json"); return
+            try:
+                import auth, requests
+                token = _read_token()
+                data = requests.get(auth.api_base() + "/user/vehicle",
+                                    headers=auth.headers_for({}, token=token), timeout=20).json().get("data")
+                v = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+                img = _vehicle_img_url(v)
+                if not img:
+                    self._send(200, json.dumps({"ok": False,
+                                                "error": "no vehicleImgConfig from CarLinko"}).encode(),
+                               "application/json"); return
+                c = _creds(); c.setdefault("vehicle", {})["img"] = img
+                cpath = os.path.join(_DATA, "creds.json")
+                json.dump(c, open(cpath, "w"), indent=2)
+                try: os.chmod(cpath, 0o600)
+                except Exception: pass
+                try: os.remove(_CAR_PHOTO)              # force a fresh cache pull
+                except Exception: pass
+                self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}).encode(),
+                           "application/json")
+            return
+        if path == "/api/config":                      # dashboard settings persisted in creds.json
+            if not self._authed():
+                self._send(401, b'{"ok":false,"error":"auth"}', "application/json"); return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode() or "{}")
+                if body.get("resync_km") not in ("skip", "count"):
+                    self._send(200, json.dumps({"ok": False,
+                                                "error": "resync_km must be skip or count"}).encode(),
+                               "application/json"); return
+                cpath = os.path.join(_DATA, "creds.json")
+                try:
+                    c = json.load(open(cpath))
+                except Exception:
+                    c = {}
+                c["resync_km"] = body["resync_km"]
+                json.dump(c, open(cpath, "w"), indent=2)
+                try: os.chmod(cpath, 0o600)
+                except Exception: pass
+                self._send(200, json.dumps({"ok": True, "resync_km": c["resync_km"]}).encode(),
+                           "application/json")
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)[:120]}).encode(),
+                           "application/json")
             return
         self._send(404, b"not found", "text/plain")
 
