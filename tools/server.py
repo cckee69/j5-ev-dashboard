@@ -697,7 +697,7 @@ def analyze(data, trips, kwh_day):
     if detail:
         out["charging"]["session"] = session_detail(detail)
     trips_all = trips
-    out["trips"] = trips_all[:8]
+    out["trips"] = trips_all[:16]
     # Overall average speed = total distance / total time, not the mean of per-trip averages
     # (one short burst trip would dominate -- a cloud catch-up of a few km in ~10 s reads as
     # 700+ km/h). Only trips that actually lasted a minute count; sub-minute "trips" are
