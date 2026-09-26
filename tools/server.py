@@ -497,15 +497,16 @@ def build_trips(data, resync_skip=True):
     for t in trips:
         dist = t["odo1"] - t["odo0"]
         if dist <= 0: continue
-        dur_min = max((t["end"] - t["start"]) / 60.0, 0.1)
-        avg = round(dist / (dur_min / 60.0)) if dur_min else None   # odo/time, reliable
+        dur_sec = max(t["end"] - t["start"],1)
+        dur_min = (dur_sec + 59) // 60
+        avg = round(dist / (dur_sec / 3600.0)) if dur_sec else None   # odo/time, reliable
         kwh = max(0.0, (t["soc0"] - t["soc1"]) / 100.0 * CAP_KWH)
         eff = round(kwh / dist * 100, 1) if kwh and dist >= 1 else None
         if eff is not None and not (5 <= eff <= 40):    # implausible (sparse-data merge, or a SoC drop
             eff = kwh = None                            # that resyncs with the odo) -> hide energy
         out.append({"start_ts": t["start"], "end_ts": t["end"],
                     "start_dt": time.strftime("%a %H:%M", time.localtime(t["start"])),
-                    "km": dist, "min": round(dur_min), "avg_kmh": avg,
+                    "km": dist, "min": dur_min, "avg_kmh": avg,
                     "kwh": round(kwh, 1) if kwh else None, "kwh100": eff})
     return out[::-1]                                    # newest first
 
