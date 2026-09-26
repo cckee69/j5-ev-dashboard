@@ -443,7 +443,7 @@ def chg_eff(soc_end):
     if soc_end >= 95: return 0.855
     if soc_end <= 85: return 0.91
     return 0.91 + (0.855 - 0.91) * (soc_end - 85) / 10.0
-TRIP_GAP = 180          # parked >3 min => a trip ends (merges short red-light stops)
+TRIP_GAP = 300          # parked >5 min => a trip ends (merges short red-light stops)
 MAX_PAIR_GAP = 1800     # >30 min between two logged frames = a hole in the log (service down, car
                         # offline, TBox asleep). The odo/SoC delta across a hole covers driving we
                         # never saw, so it can't be attributed to a day/week/trip -- skip the pair.
