@@ -150,7 +150,7 @@ PARK   = int(_C.get("poll_parked")  or 30)  # parked, engine off, not charging: 
                                             # still catches a wake (ignition/plug-in) within 30 s,
                                             # then it jumps to ACTIVE. Set to 5 for always-real-time.
 OFFLINE_SLOW = int(_C.get("poll_offline") or 900)  # genuinely dark (basement, no signal) -> back off
-HOLD = 600         # keep ACTIVE this long after the last sign of activity (bridges a brief stop)
+HOLD = 120         # keep ACTIVE this long after the last sign of activity (bridges a brief stop)
 OFFLINE_AFTER = 3  # consecutive empty polls before the car counts as dark
 CHG_LOOKBACK = 900 # window (s) to spot an ongoing charge from a SoC rise. SoC is 1%-coarse, so a
                    # slow AC charge won't tick a whole percent between two polls -- comparing the
@@ -172,16 +172,21 @@ def adaptive_loop(conn):
         now = time.time()
         if st:
             miss = 0
-            soc = st.get("battery"); odo = st.get("odo_guess")
-            # on the road = odometer advancing, or the car unlocked (b3 -- the "in use" hint; the
-            # lock/unlock byte verified in #5, previously mistaken for ignition). Charging is
-            # handled separately below (b3 is 0 on some cars while charging).
-            driving = bool(st.get("unlocked")) or (last_odo is not None and odo is not None and odo > last_odo)
+            # 1. Retrieve variables FIRST
+            soc = st.get("battery")
+            odo = st.get("odo_guess")
+            is_moving = (
+               last_odo is not None and odo is not None and odo > last_odo
+            )
+            has_speed = st.get("speed") is not None and st.get("speed", 0) > 0
+            driving = is_moving or has_speed
+          
             if soc is not None:
-                soc_hist.append((now, soc))
+               soc_hist.append((now, soc))
             if driving:
-                active_until = now + HOLD
-            if odo is not None: last_odo = odo
+               active_until = now + HOLD  # Extends active polling window
+            if odo is not None: 
+               last_odo = odo
         else:
             miss += 1
         # charge detector: SoC now above the window's low => still gaining => plugged in. Survives
