@@ -142,7 +142,7 @@ def poll_once(conn, _retried=False):
 # charging, or the car unlocked/in use -- and ease off only when it's parked+idle or genuinely
 # dark. All three
 # tiers are overridable from creds.json so you can tune without editing code.
-ACTIVE = int(_C.get("poll_active")  or 60)   # driving / charging / unlocked -> near real-time.
+ACTIVE = int(_C.get("poll_active")  or 30)   # driving / charging / unlocked -> near real-time.
                                             # The cloud has its own push lag, so below ~5 s just
                                             # re-fetches the same frame and hammers CarLinko.
 PARK   = int(_C.get("poll_parked")  or 600)  # parked, engine off, not charging: cloud just replays
@@ -150,7 +150,7 @@ PARK   = int(_C.get("poll_parked")  or 600)  # parked, engine off, not charging:
                                             # still catches a wake (ignition/plug-in) within 30 s,
                                             # then it jumps to ACTIVE. Set to 5 for always-real-time.
 OFFLINE_SLOW = int(_C.get("poll_offline") or 900)  # genuinely dark (basement, no signal) -> back off
-HOLD = 120         # keep ACTIVE this long after the last sign of activity (bridges a brief stop)
+HOLD = 300         # keep ACTIVE this long after the last sign of activity (bridges a brief stop)
 OFFLINE_AFTER = 3  # consecutive empty polls before the car counts as dark
 CHG_LOOKBACK = 900 # window (s) to spot an ongoing charge from a SoC rise. SoC is 1%-coarse, so a
                    # slow AC charge won't tick a whole percent between two polls -- comparing the
