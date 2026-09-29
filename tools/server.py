@@ -880,6 +880,23 @@ def summary():
                unlocked=dec.get("unlocked"), speed=None, updated=dt)
     out["age_min"] = round((time.time() - ts) / 60, 1)
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
+
+    # --- STATUS STATE DETERMINATION ---
+    # 1. First preference: use explicit status_state if present in decoded payload
+    status_state = dec.get("status_state")
+
+    # 2. Fallback: compute state based on speed and ignition/power status
+    if not status_state:
+        if dec.get("speed", 0) > 0 or out.get("moving"):
+            status_state = "DRIVING"
+        elif bool(dec.get("unlocked")) or bool(dec.get("engine_on")):
+            status_state = "HALT"
+        else:
+            status_state = "PARKED"
+
+    out["status"] = status_state
+    out["status_state"] = status_state
+
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
     # an empty tank still counts as a PHEV. A BEV reports 0 for both bytes forever and stays "bev",
     # which keeps the fuel UI off every existing install.
