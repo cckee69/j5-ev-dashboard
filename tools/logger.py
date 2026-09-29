@@ -171,22 +171,43 @@ def adaptive_loop(conn):
             print("poll error:", repr(e)); st = None
         now = time.time()
         if st:
-            miss = 0
-            # 1. Retrieve variables FIRST
-            soc = st.get("battery")
-            odo = st.get("odo_guess")
-            is_moving = (
-               last_odo is not None and odo is not None and odo > last_odo
-            )
-            has_speed = st.get("speed") is not None and st.get("speed", 0) > 0
-            driving = is_moving or has_speed
-          
-            if soc is not None:
-               soc_hist.append((now, soc))
-            if driving:
-               active_until = now + HOLD  # Extends active polling window
-            if odo is not None: 
-               last_odo = odo
+          miss = 0
+          soc = st.get("battery")
+          odo = st.get("odo_guess")
+        
+          # 1. Determine vehicle power / usage status
+          is_powered = bool(st.get("unlocked")) or bool(st.get("engine_on"))
+        
+          # 2. Determine movement
+          is_moving = last_odo is not None and odo is not None and odo > last_odo
+          has_speed = st.get("speed") is not None and st.get("speed", 0) > 0
+          moving = is_moving or has_speed
+        
+          # 3. Differentiate DRIVING, HALT, and PARKED
+          if is_powered and moving:
+            status_state = "DRIVING"
+            driving_active = True
+          elif is_powered and not moving:
+            status_state = "HALT"  # Stopped at traffic light / traffic jam
+            driving_active = True
+          elif time.time() < active_until:
+            status_state = "HALT"  # Still inside HOLD buffer period after stopping
+            driving_active = False
+          else:
+            status_state = "PARKED"
+            driving_active = False
+        
+          # Explicitly store state into status dictionary so server/db reads "HALT"
+          st["status_state"] = status_state
+        
+          if soc is not None:
+            soc_hist.append((now, soc))
+        
+          if driving_active:
+            active_until = now + HOLD  # Keep fast 30s polling active
+        
+          if odo is not None:
+            last_odo = odo
         else:
             miss += 1
         # charge detector: SoC now above the window's low => still gaining => plugged in. Survives
