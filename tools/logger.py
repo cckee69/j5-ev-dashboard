@@ -222,7 +222,13 @@ def adaptive_loop(conn):
             delay = OFFLINE_SLOW                       # genuinely dark for a while -> back off
         else:
             delay = PARK                               # parked + idle + online
-        time.sleep(delay)
+   #     time.sleep(delay)
+        sleep_end = time.time() + delay
+        while time.time() < sleep_end:
+          # If a WebSocket push sets a global 'car_woke_up' flag or if active_until is extended:
+          if time.time() < active_until:
+            break  # Wake up immediately!
+          time.sleep(1)
 
 # ---- persistent stream (recommended): hold ONE socket, like the CarLinko app does ----
 # The probe proved the cloud PUSHES an action:6 frame whenever the car reports a change, as long as
