@@ -145,7 +145,7 @@ def poll_once(conn, _retried=False):
 ACTIVE = int(_C.get("poll_active")  or 30)   # driving / charging / unlocked -> near real-time.
                                             # The cloud has its own push lag, so below ~5 s just
                                             # re-fetches the same frame and hammers CarLinko.
-PARK   = int(_C.get("poll_parked")  or 600)  # parked, engine off, not charging: cloud just replays
+PARK   = int(_C.get("poll_parked")  or 60)  # parked, engine off, not charging: cloud just replays
                                             # the last frame, so 5 s would spam identical bytes. 30 s
                                             # still catches a wake (ignition/plug-in) within 30 s,
                                             # then it jumps to ACTIVE. Set to 5 for always-real-time.
