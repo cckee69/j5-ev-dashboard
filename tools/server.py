@@ -864,45 +864,58 @@ def summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    # Explicitly fetch speed and status_state from the table
-    row = conn.execute(
-        "SELECT ts, dt, online, raw, speed, status_state FROM telemetry ORDER BY ts DESC LIMIT 1"
-    ).fetchone()
+    conn.row_factory = sqlite3.Row  # Access columns by name safely
+
+    # Fetch historical rows for raw decode
+    rows = conn.execute("SELECT * FROM telemetry ORDER BY ts").fetchall()
     
-    if not row:
+    data = []
+    for r in rows:
+        r_dict = dict(r)
+        if r_dict.get("online") != 1 or not r_dict.get("raw"):
+            continue
+        data.append((r_dict["ts"], r_dict["dt"], decode(r_dict["raw"]), r_dict))
+
+    if not data:
+        out["status"] = "PARKED"
+        out["status_state"] = "PARKED"
         return out
-    
-    ts, dt, online, raw, db_speed, db_status_state = row
-    
-    # Decode raw blob for battery/range
-    dec = decode(raw) if raw else {}
-    
+
+    # Get the latest row and its decoded payload
+    ts, dt, dec, last_row = data[-1]
+
+    # Extract speed safely (prefer DB value, fallback to decoded raw blob)
+    db_speed = last_row.get("speed")
+    current_speed = db_speed if db_speed is not None else dec.get("speed", 0.0)
+
     out.update(
         battery=dec.get("battery"),
         range_km=dec.get("range_km"),
         odometer=dec.get("odometer"),
         volt12=dec.get("volt12"),
         unlocked=dec.get("unlocked"),
-        speed=db_speed if db_speed is not None else 0.0,
+        speed=current_speed,
         updated=dt
     )
+
     out["age_min"] = round((time.time() - ts) / 60, 1)
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
-    
-    # --- USE DATABASE STATUS_STATE FIRST ---
-    status_state = db_status_state or dec.get("status_state")
-    
-    # Backup calculation if database field happens to be empty
+
+    # Read status_state directly from DB column first
+    status_state = last_row.get("status_state") or dec.get("status_state")
+
+    # Fallback state determination if DB column is empty
     if not status_state:
-        if out["speed"] > 0:
+        if current_speed > 0 or out.get("moving"):
             status_state = "DRIVING"
-        elif bool(out.get("unlocked")):
+        elif bool(dec.get("unlocked")) or bool(dec.get("engine_on")):
             status_state = "HALT"
         else:
             status_state = "PARKED"
-    
+
     out["status"] = status_state
     out["status_state"] = status_state
+
 
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
     # an empty tank still counts as a PHEV. A BEV reports 0 for both bytes forever and stays "bev",
