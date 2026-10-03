@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS telemetry (
   tyre_raw  TEXT,                  -- 8 bytes hex (4 psi + 4 temp), FF=invalid
   online    INTEGER,               -- 1 if a fresh blob arrived
   raw       TEXT                   -- full blob hex (for back-decoding)
+  speed REAL DEFAULT 0.0,
+  status_state TEXT DEFAULT 'PARKED'
 );
 """
 
@@ -125,18 +127,60 @@ def poll_once(conn, _retried=False):
     ts = int(time.time())
     dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
     if blob:
-        d = decode(blob)
-        conn.execute(
-            "INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?,?,?,?,?)",
-            (ts, dt, d.get("battery"), d.get("range_km"), d.get("odo_guess"),
-             d.get("tyre_raw"), 1, blob))
-        print(f"{dt}  battery={d.get('battery')}%  range={d.get('range_km')}km  "
-              f"odo?={d.get('odo_guess')}  spd={d.get('speed')}  unl={d.get('unlocked')}")
-        return d
-    conn.execute("INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?,?,?,?,?)",
-                 (ts, dt, None, None, None, None, 0, None))
-    print(f"{dt}  (no blob — car offline/basement)")
-    return None
+      d = decode(blob)
+
+      # 1. Determine speed (default to 0.0 if not present in decode dict)
+      speed = d.get("speed") if d.get("speed") is not None else 0.0
+
+      # 2. Determine status_state logic
+      # Adjust flags if your decode dict uses 'unlocked', 'ignition', or 'power'
+      is_powered = d.get("unlocked") or d.get("power") or d.get("engine_on")
+      if is_powered and speed > 0:
+        status_state = "DRIVING"
+      elif is_powered:
+        status_state = "HALT"
+      else:
+        status_state = "PARKED"
+
+      # 3. Store status_state back into dictionary for caller use
+      d["status_state"] = status_state
+
+      # 4. Updated INSERT with explicit column names and 10 parameters
+      conn.execute(
+          """
+            INSERT OR REPLACE INTO telemetry 
+            (ts, dt, battery, range_km, odo_guess, tyre_raw, online, raw, speed, status_state)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+          (
+              ts,
+              dt,
+              d.get("battery"),
+              d.get("range_km"),
+              d.get("odo_guess"),
+              d.get("tyre_raw"),
+              1,
+              blob,
+              speed,
+              status_state,
+          ),
+      )
+
+      print(
+          f"{dt}  battery={d.get('battery')}%  range={d.get('range_km')}km  "
+          f"odo?={d.get('odo_guess')}  spd={speed}  status={status_state}"
+      )
+      return d
+
+    # Offline / missing blob fallback query (10 parameters)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO telemetry 
+        (ts, dt, battery, range_km, odo_guess, tyre_raw, online, raw, speed, status_state)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """,
+        (ts, dt, None, None, None, None, 0, None, 0.0, "PARKED"),
+    )
 
 # adaptive cadence (seconds). Near-real-time while the car is doing anything -- on the road,
 # charging, or the car unlocked/in use -- and ease off only when it's parked+idle or genuinely
