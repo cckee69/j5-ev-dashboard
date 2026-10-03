@@ -145,7 +145,7 @@ def poll_once(conn, _retried=False):
 ACTIVE = int(_C.get("poll_active")  or 30)   # driving / charging / unlocked -> near real-time.
                                             # The cloud has its own push lag, so below ~5 s just
                                             # re-fetches the same frame and hammers CarLinko.
-PARK   = int(_C.get("poll_parked")  or 60)  # parked, engine off, not charging: cloud just replays
+PARK   = int(_C.get("poll_parked")  or 600)  # parked, engine off, not charging: cloud just replays
                                             # the last frame, so 5 s would spam identical bytes. 30 s
                                             # still catches a wake (ignition/plug-in) within 30 s,
                                             # then it jumps to ACTIVE. Set to 5 for always-real-time.
@@ -163,7 +163,6 @@ def adaptive_loop(conn):
     last_odo = None
     soc_hist = []      # (ts, soc) within CHG_LOOKBACK, to spot a slow charge the prior frame can't
     miss = 0
-    print("[DEBUG POLL]", st) #check what key - speed, spd or vehicle_speed, what ignition.
     while True:
         try:
             st = poll_once(conn)
@@ -176,47 +175,37 @@ def adaptive_loop(conn):
           soc = st.get("battery")
           odo = st.get("odo_guess")
         
-          # 1. Retrieve raw speed and power indicators
-          speed = st.get("speed") or 0
+          # 1. Determine vehicle power / usage status
+          is_powered = bool(st.get("unlocked")) or bool(st.get("engine_on"))
+        
+          # 2. Determine movement
           is_moving = last_odo is not None and odo is not None and odo > last_odo
-          has_speed = speed > 0
+          has_speed = st.get("speed") is not None and st.get("speed", 0) > 0
+          moving = is_moving or has_speed
         
-          # 2. Check all potential ignition/power indicators from the telematics API
-          is_powered = (
-              bool(st.get("engine_on"))
-              or bool(st.get("ignition"))
-              or bool(st.get("acc_stat"))
-              or bool(st.get("unlocked"))
-              or has_speed
-              or is_moving
-          )
-        
-          # 3. Explicitly set common OEM keys so the app frontend recognizes active drive
-          if is_powered:
-            st["engine_on"] = 1
-            st["power_state"] = 1
-            st["is_running"] = 1 if (has_speed or is_moving) else 0
-        
-          # 4. State logic for adaptive timing & custom logging
-          if is_powered and (has_speed or is_moving):
+          # 3. Differentiate DRIVING, HALT, and PARKED
+          if is_powered and moving:
             status_state = "DRIVING"
             driving_active = True
-          elif is_powered:
-            status_state = "HALT"
+          elif is_powered and not moving:
+            status_state = "HALT"  # Stopped at traffic light / traffic jam
             driving_active = True
           elif time.time() < active_until:
-            status_state = "HALT"
+            status_state = "HALT"  # Still inside HOLD buffer period after stopping
             driving_active = False
           else:
             status_state = "PARKED"
             driving_active = False
         
+          # Explicitly store state into status dictionary so server/db reads "HALT"
           st["status_state"] = status_state
         
           if soc is not None:
             soc_hist.append((now, soc))
+        
           if driving_active:
-            active_until = now + HOLD
+            active_until = now + HOLD  # Keep fast 30s polling active
+        
           if odo is not None:
             last_odo = odo
         else:
@@ -225,15 +214,8 @@ def adaptive_loop(conn):
         # the 1%-coarse SoC that looks flat frame-to-frame, so a slow charge stays real-time. When
         # the charge ends (or the car unplugs) the low catches up within CHG_LOOKBACK and releases.
         soc_hist = [(t, s) for (t, s) in soc_hist if now - t <= CHG_LOOKBACK]
-
-        # 2. Safe charging detection (prevents ValueError if soc_hist is empty)
-        charging = (
-             bool(soc_hist) 
-             and len(soc_hist) > 1
-             and soc_hist[-1][1] > min(s for _t, s in soc_hist)
-        )
-        # 3. Stay fast if driving, HALT buffer active, or charging
-        awake = driving_active or charging or time.time() < active_until
+        charging = bool(soc_hist) and soc_hist[-1][1] > min(s for _t, s in soc_hist)
+        awake = charging or time.time() < active_until
         if awake:                                      # on the road or plugged in -> near real-time.
             delay = ACTIVE                             # a momentary empty frame here is a transient WS
         elif miss >= OFFLINE_AFTER:                    # hiccup (car still awake), so we stay fast.
@@ -241,12 +223,6 @@ def adaptive_loop(conn):
         else:
             delay = PARK                               # parked + idle + online
         time.sleep(delay)
-        #sleep_end = time.time() + delay
-        #while time.time() < sleep_end:
-          # If a WebSocket push sets a global 'car_woke_up' flag or if active_until is extended:
-          #if time.time() < active_until:
-            #break  # Wake up immediately!
-         # time.sleep(1)
 
 # ---- persistent stream (recommended): hold ONE socket, like the CarLinko app does ----
 # The probe proved the cloud PUSHES an action:6 frame whenever the car reports a change, as long as
