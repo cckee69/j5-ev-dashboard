@@ -864,47 +864,32 @@ def summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row  # Access columns by name safely
-
-    # Fetch historical rows for raw decode
-    rows = conn.execute("SELECT * FROM telemetry ORDER BY ts").fetchall()
-    
+    rows = conn.execute(
+        "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    # decode authoritatively from the stored raw blob (offset fixes apply to all history)
     data = []
-    for r in rows:
-        r_dict = dict(r)
-        if r_dict.get("online") != 1 or not r_dict.get("raw"):
+    for ts, dt, online, raw in rows:
+        if online != 1 or not raw:
             continue
-        data.append((r_dict["ts"], r_dict["dt"], decode(r_dict["raw"]), r_dict))
-
+        data.append((ts, dt, decode(raw)))
     if not data:
-        out["status"] = "PARKED"
-        out["status_state"] = "PARKED"
         return out
+    ts, dt, dec = data[-1]
 
-    # Get the latest row and its decoded payload
-    ts, dt, dec, last_row = data[-1]
+    # --- 1. EXTRACT SPEED FROM DECODED PAYLOAD ---
+    current_speed = dec.get("speed") if dec.get("speed") is not None else 0.0
 
-    # Extract speed safely (prefer DB value, fallback to decoded raw blob)
-    db_speed = last_row.get("speed")
-    current_speed = db_speed if db_speed is not None else dec.get("speed", 0.0)
-
-    out.update(
-        battery=dec.get("battery"),
-        range_km=dec.get("range_km"),
-        odometer=dec.get("odometer"),
-        volt12=dec.get("volt12"),
-        unlocked=dec.get("unlocked"),
-        speed=current_speed,
-        updated=dt
-    )
-
+    out.update(battery=dec.get("battery"), range_km=dec.get("range_km"),
+               odometer=dec.get("odometer"), volt12=dec.get("volt12"),
+               unlocked=dec.get("unlocked"), speed=current_speed, updated=dt)
     out["age_min"] = round((time.time() - ts) / 60, 1)
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
 
-    # Read status_state directly from DB column first
-    status_state = last_row.get("status_state") or dec.get("status_state")
+    # --- 2. STATUS STATE DETERMINATION ---
+    # First preference: use explicit status_state if present in decoded payload
+    status_state = dec.get("status_state")
 
-    # Fallback state determination if DB column is empty
+    # Fallback: compute state based on speed and ignition/power status
     if not status_state:
         if current_speed > 0 or out.get("moving"):
             status_state = "DRIVING"
@@ -915,7 +900,6 @@ def summary():
 
     out["status"] = status_state
     out["status_state"] = status_state
-
 
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
     # an empty tank still counts as a PHEV. A BEV reports 0 for both bytes forever and stays "bev",
