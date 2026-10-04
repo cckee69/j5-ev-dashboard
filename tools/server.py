@@ -864,31 +864,41 @@ def summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    rows = conn.execute(
-        "SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ts, dt, online, raw, speed, status_state FROM telemetry ORDER BY ts")
+    rows = cursor.fetchall()
+    conn.close()
+
+    
+    #rows = conn.execute("SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
     # decode authoritatively from the stored raw blob (offset fixes apply to all history)
     data = []
-    for ts, dt, online, raw in rows:
+    for ts, dt, online, raw, speed, status_state in rows:
         if online != 1 or not raw:
             continue
-        data.append((ts, dt, decode(raw)))
+        dec = decode(raw) if raw else {}
+        data.append((ts, dt, dec, speed, status_state))        
     if not data:
         return out
-    ts, dt, dec = data[-1]
+    #ts, dt, dec = data[-1]
+    # Unpack the latest valid record
+    ts, dt, dec, db_speed, db_status_state = data[-1]
 
     # --- 1. EXTRACT SPEED FROM DECODED PAYLOAD ---
-    current_speed = dec.get("speed") if dec.get("speed") is not None else 0.0
+    #current_speed = dec.get("speed") if dec.get("speed") is not None else 0.0
+    # Resolve speed (prefer DB value, fallback to decoded dict, default 0.0)
+    current_speed = db_speed if db_speed is not None else dec.get("speed", 0.0)
 
     out.update(battery=dec.get("battery"), range_km=dec.get("range_km"),
                odometer=dec.get("odometer"), volt12=dec.get("volt12"),
                unlocked=dec.get("unlocked"), speed=current_speed, updated=dt)
-    out["age_min"] = round((time.time() - ts) / 60, 1)
+    out["age_min"] = round((time.time() - ts) / 60, 1) if ts else None
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
 
     # --- 2. STATUS STATE DETERMINATION ---
     # First preference: use explicit status_state if present in decoded payload
-    status_state = dec.get("status_state")
-
+    #status_state = dec.get("status_state")
+    status_state = db_status_state or dec.get("status_state")
     # Fallback: compute state based on speed and ignition/power status
     if not status_state:
         if current_speed > 0 or out.get("moving"):
