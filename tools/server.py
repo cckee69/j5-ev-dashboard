@@ -864,22 +864,26 @@ def summary():
     if not os.path.exists(DB):
         return out
     conn = sqlite3.connect(DB)
-    cursor = conn.cursor()
-    cursor.execute("SELECT ts, dt, online, raw, speed, status_state FROM telemetry ORDER BY ts")
-    rows = cursor.fetchall()
-    conn.close()
+    rows = conn.execute(
+        "SELECT ts, dt, online, raw, speed, status_state FROM telemetry ORDER BY ts"
+    ).fetchall()
 
-    
-    #rows = conn.execute("SELECT ts,dt,online,raw FROM telemetry ORDER BY ts").fetchall()
-    # decode authoritatively from the stored raw blob (offset fixes apply to all history)
     data = []
     for ts, dt, online, raw, speed, status_state in rows:
-        if online != 1 or not raw:
-            continue
-        dec = decode(raw) if raw else {}
-        data.append((ts, dt, dec, speed, status_state))        
+      if online != 1 or not raw:
+        continue
+      dec = decode(raw) if raw else {}
+
+      # Attach DB values to the dec dictionary
+      dec["speed"] = speed if speed is not None else dec.get("speed", 0.0)
+      dec["status_state"] = status_state or dec.get("status_state")
+
+      # Keep 3-element tuple structure so all downstream code works seamlessly
+      data.append((ts, dt, dec))
+
     if not data:
-        return out
+      return out
+
     #ts, dt, dec = data[-1]
     # Unpack the latest valid record
     ts, dt, dec, db_speed, db_status_state = data[-1]
