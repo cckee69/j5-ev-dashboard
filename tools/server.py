@@ -884,28 +884,28 @@ def summary():
     if not data:
       return out
 
-    #ts, dt, dec = data[-1]
+    ts, dt, dec = data[-1]
     # Unpack the latest valid record
-    ts, dt, dec, db_speed, db_status_state = data[-1]
+    #ts, dt, dec, db_speed, db_status_state = data[-1]
 
     # --- 1. EXTRACT SPEED FROM DECODED PAYLOAD ---
     #current_speed = dec.get("speed") if dec.get("speed") is not None else 0.0
     # Resolve speed (prefer DB value, fallback to decoded dict, default 0.0)
-    current_speed = db_speed if db_speed is not None else dec.get("speed", 0.0)
+    #current_speed = db_speed if db_speed is not None else dec.get("speed", 0.0)
 
     out.update(battery=dec.get("battery"), range_km=dec.get("range_km"),
                odometer=dec.get("odometer"), volt12=dec.get("volt12"),
-               unlocked=dec.get("unlocked"), speed=current_speed, updated=dt)
+               unlocked=dec.get("unlocked"), speed=dec.get("speed", 0.0), updated=dt)
     out["age_min"] = round((time.time() - ts) / 60, 1) if ts else None
     out["online"] = out["age_min"] is not None and out["age_min"] < 40
 
     # --- 2. STATUS STATE DETERMINATION ---
     # First preference: use explicit status_state if present in decoded payload
-    #status_state = dec.get("status_state")
-    status_state = db_status_state or dec.get("status_state")
+    status_state = dec.get("status_state")
+    #status_state = db_status_state or dec.get("status_state")
     # Fallback: compute state based on speed and ignition/power status
     if not status_state:
-        if current_speed > 0 or out.get("moving"):
+        if current_speed > 0 or dec.get("moving"):
             status_state = "DRIVING"
         elif bool(dec.get("unlocked")) or bool(dec.get("engine_on")):
             status_state = "HALT"
@@ -914,6 +914,8 @@ def summary():
 
     out["status"] = status_state
     out["status_state"] = status_state
+
+    return out
 
     # Fuel side of a PHEV. Decided over the whole window, not the latest frame, so a car sitting at
     # an empty tank still counts as a PHEV. A BEV reports 0 for both bytes forever and stays "bev",
