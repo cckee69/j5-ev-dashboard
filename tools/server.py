@@ -1664,12 +1664,16 @@ class H(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
 def main():
-    ports = [a for a in sys.argv[1:] if a.isdigit()]       # ignore flags like --demo
-    port = int(ports[0]) if ports else 8088
+    ports = [a for a in sys.argv[1:] if a.isdigit()]       # CLI arguments take precedence
+    if ports:
+        port = int(ports[0])
+    else:
+        port = int(os.environ.get("PORT", 8088))            # Render / environment variable fallback
+
     if DEMO:
         print(f"CarLinko dashboard (DEMO — fake data) on http://0.0.0.0:{port}")
     else:
-        _ensure_db()                                       # so a brand-new install serves without crashing
+        _ensure_db()                                        # so a brand-new install serves without crashing
         print(f"CarLinko dashboard on http://0.0.0.0:{port}  (db={os.path.abspath(DB)})")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 
